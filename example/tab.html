@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>idempotent-queue: one tab</title>
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; margin: 12px; }
+      button { margin: 0 6px 6px 0; }
+      table { border-collapse: collapse; width: 100%; }
+      td, th { border-bottom: 1px solid #ddd; padding: 2px 6px; text-align: left; font-family: ui-monospace, monospace; font-size: 12px; }
+      .sender { color: #0a7d32; font-weight: 600; }
+      .waiting { color: #8a6d00; }
+    </style>
+  </head>
+  <body>
+    <h3 id="title">Tab</h3>
+    <p id="role" class="waiting">Starting…</p>
+    <button id="pay">Pay €25</button>
+    <button id="again" disabled>Pay again with the same key</button>
+    <button id="clear">Clear the queue</button>
+    <table>
+      <thead><tr><th>key</th><th>status</th><th>attempts</th></tr></thead>
+      <tbody id="items"></tbody>
+    </table>
+    <script type="module">
+      import { createIdempotentQueue, fetchSender } from '../lib/module/index.js';
+      import { fakeServerFetch } from './server.js';
+
+      const params = new URLSearchParams(location.search);
+      // `?nolocks` hides Web Locks, to try the BroadcastChannel fallback used by older browsers.
+      if (params.has('nolocks')) Object.defineProperty(navigator, 'locks', { value: undefined });
+      const name = params.get('name') || 'Tab';
+      const storageKey = params.get('storageKey') || 'idempotent-queue-example';
+      document.getElementById('title').textContent = name;
+
+      // Defaults in a browser: IndexedDB storage, Web Locks (BroadcastChannel locks where Web Locks
+      // are missing), BroadcastChannel change notifications, navigator.onLine and visibilitychange.
+      const queue = createIdempotentQueue({
+        storageKey,
+        send: fetchSender('/api/payments', undefined, {
+          fetch: fakeServerFetch(storageKey, Number(params.get('latency') || 1500)),
+          keepalive: 'pagehide',
+        }),
+        retry: { maxAttempts: 5, baseDelayMs: 500, maxDelayMs: 5000 },
+      });
+
+      let lastKey;
+      const role = document.getElementById('role');
+      const render = () => {
+        role.textContent = queue.isSender()
+          ? 'This tab sends the queue.'
+          : 'Another tab sends the queue. Close it and this tab takes over.';
+        role.className = queue.isSender() ? 'sender' : 'waiting';
+        document.getElementById('items').innerHTML = queue
+          .getItems()
+          .map((item) => `<tr><td>${item.key}</td><td>${item.status}</td><td>${item.attempts}</td></tr>`)
+          .join('');
+      };
+      queue.subscribe(render);
+
+      document.getElementById('pay').onclick = async () => {
+        const item = await queue.enqueue({ payload: { amount: 2500, currency: 'EUR', from: name }, group: 'payments' });
+        lastKey = item.key;
+        document.getElementById('again').disabled = false;
+      };
+      // A double tap: the same key returns the existing item and sends nothing new.
+      document.getElementById('again').onclick = () =>
+        queue.enqueue({ payload: { amount: 2500, currency: 'EUR', from: name }, key: lastKey });
+      document.getElementById('clear').onclick = () => queue.clear();
+
+      await queue.start();
+      render();
+      // For index.html, which drives the tabs in its self-test.
+      window.app = { queue, name };
+    </script>
+  </body>
+</html>

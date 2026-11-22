@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>idempotent-queue: two tabs, one queue</title>
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; max-width: 1100px; }
+      .tabs { display: flex; gap: 12px; }
+      .tab { flex: 1; border: 1px solid #bbb; border-radius: 6px; padding: 6px; }
+      iframe { width: 100%; height: 320px; border: 0; }
+      pre { background: #f4f4f4; padding: 8px; font-size: 12px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h2>Two tabs, one queue</h2>
+    <p>
+      Each frame below runs its own queue, like a separate tab. They share IndexedDB, Web Locks and
+      BroadcastChannel, because they have the same origin. One of them holds the sender lock and sends.
+      Enqueue a payment in either frame, then close the sending frame while its request is in flight:
+      the other frame takes over and sends the same key again. The pretend server applies it once.
+      Opening <a href="tab.html?name=Real%20tab" target="_blank">tab.html</a> in two real tabs works the same way.
+    </p>
+    <div class="tabs">
+      <div class="tab" id="slot-a"><button data-close="a">Close tab A</button> <button data-open="a">Reopen tab A</button></div>
+      <div class="tab" id="slot-b"><button data-close="b">Close tab B</button> <button data-open="b">Reopen tab B</button></div>
+    </div>
+    <h3>Pretend server</h3>
+    <pre id="server"></pre>
+    <pre id="result"></pre>
+    <script type="module">
+      import { readLedger, resetLedger } from './server.js';
+
+      const params = new URLSearchParams(location.search);
+      const selftest = params.has('selftest');
+      // The self-test uses fresh storage, so earlier clicks do not affect it.
+      const storageKey = selftest ? `idempotent-queue-selftest-${Date.now()}` : 'idempotent-queue-example';
+      const latency = selftest ? 800 : 1500;
+      const frames = {};
+
+      function open(slot) {
+        if (frames[slot]) return;
+        const frame = document.createElement('iframe');
+        const extra = params.has('nolocks') ? '&nolocks' : '';
+        frame.src = `tab.html?name=Tab%20${slot.toUpperCase()}&storageKey=${storageKey}&latency=${latency}${extra}`;
+        document.getElementById(`slot-${slot}`).appendChild(frame);
+        frames[slot] = frame;
+      }
+      // Removing the frame destroys its page, like closing a tab: its locks are released and its request is abandoned.
+      function close(slot) {
+        if (!frames[slot]) return;
+        frames[slot].remove();
+        delete frames[slot];
+      }
+      document.querySelectorAll('[data-close]').forEach((button) => (button.onclick = () => close(button.dataset.close)));
+      document.querySelectorAll('[data-open]').forEach((button) => (button.onclick = () => open(button.dataset.open)));
+      open('a');
+      open('b');
+      setInterval(() => {
+        document.getElementById('server').textContent = JSON.stringify(readLedger(storageKey), null, 2);
+      }, 200);
+
+      async function waitFor(what, check, ms = 10000) {
+        const until = Date.now() + ms;
+        for (;;) {
+          const value = check();
+          if (value) return value;
+          if (Date.now() > until) throw new Error(`timed out waiting for ${what}`);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+
+      const app = (slot) => frames[slot] && frames[slot].contentWindow && frames[slot].contentWindow.app;
+
+      async function runSelfTest() {
+        resetLedger(storageKey);
+        await waitFor('both tabs to start', () => app('a') && app('b'));
+        const sender = await waitFor('a sending tab', () => ['a', 'b'].find((slot) => app(slot).queue.isSender()));
+        const other = sender === 'a' ? 'b' : 'a';
+        const steps = [`tab ${sender} sends`];
+        // Enqueue in the tab that does not send.
+        const item = await app(other).queue.enqueue({ payload: { amount: 2500, currency: 'EUR' }, key: 'order-1' });
+        await waitFor('the sending tab to send', () => readLedger(storageKey).requests['order-1'] === 1);
+        steps.push(`enqueued in tab ${other}; tab ${sender} sent it`);
+        close(sender);
+        steps.push(`closed tab ${sender} while its request was in flight`);
+        await waitFor('the other tab to take over and succeed', () => {
+          const queue = app(other).queue;
+          const current = queue.getItems().find((entry) => entry.id === item.id);
+          return queue.isSender() && current && current.status === 'succeeded' && current;
+        });
+        const ledger = readLedger(storageKey);
+        steps.push(`tab ${other} took over and sent the same key again`);
+        const pass = ledger.requests['order-1'] === 2 && Object.keys(ledger.payments).length === 1;
+        return { pass, steps, requests: ledger.requests, payments: Object.keys(ledger.payments).length };
+      }
+
+      function report(result) {
+        document.getElementById('result').textContent = `${result.pass ? 'PASS' : 'FAIL'}\n${JSON.stringify(result, null, 2)}`;
+        // Lets a script that serves this page read the result from the server's request log.
+        fetch(`/selftest-result?${encodeURIComponent(JSON.stringify(result))}`).catch(() => undefined);
+      }
+
+      if (selftest) runSelfTest().then(report, (error) => report({ pass: false, error: String(error) }));
+    </script>
+  </body>
+</html>

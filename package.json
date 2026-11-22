@@ -1,0 +1,105 @@
+{
+  "name": "idempotent-queue",
+  "version": "0.1.0",
+  "description": "A persistent request queue for browsers and Node that saves each state-changing request before sending it, retries it with the same idempotency key after failures, reloads and closed tabs, and lets only one tab send a request at a time.",
+  "main": "lib/commonjs/index.js",
+  "module": "lib/module/index.js",
+  "types": "lib/typescript/commonjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./lib/typescript/module/index.d.ts",
+        "default": "./lib/module/index.js"
+      },
+      "require": {
+        "types": "./lib/typescript/commonjs/index.d.ts",
+        "default": "./lib/commonjs/index.js"
+      }
+    },
+    "./react": {
+      "import": {
+        "types": "./lib/typescript/module/react.d.ts",
+        "default": "./lib/module/react.js"
+      },
+      "require": {
+        "types": "./lib/typescript/commonjs/react.d.ts",
+        "default": "./lib/commonjs/react.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+      "react": [
+        "lib/typescript/commonjs/react.d.ts"
+      ]
+    }
+  },
+  "sideEffects": false,
+  "author": "Moksh Upadhyay <mokshupadhyay4@gmail.com>",
+  "homepage": "https://github.com/mokshupadhyay/idempotent-queue#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mokshupadhyay/idempotent-queue.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mokshupadhyay/idempotent-queue/issues"
+  },
+  "files": [
+    "src",
+    "lib",
+    "!**/__tests__",
+    "!**/*.test.ts",
+    "!**/*.test.tsx",
+    "!**/*.map"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "check": "npm run typecheck && npm test && npm run build",
+    "mutation-check": "node scripts/mutation-check.mjs",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "keywords": [
+    "idempotency",
+    "idempotency-key",
+    "offline",
+    "queue",
+    "retry",
+    "backoff",
+    "payments",
+    "indexeddb",
+    "web-locks",
+    "broadcastchannel",
+    "multi-tab"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "react": ">=16.8.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.13",
+    "@babel/preset-env": "^7.29.14",
+    "@babel/preset-typescript": "^7.29.7",
+    "@types/jest": "^29.5.14",
+    "@types/react": "^19.3.0",
+    "@types/react-test-renderer": "^19.3.1",
+    "babel-jest": "^29.7.0",
+    "fake-indexeddb": "^6.2.8",
+    "fast-check": "^4.11.0",
+    "jest": "^29.7.0",
+    "react": "^19.3.1",
+    "react-test-renderer": "^19.3.1",
+    "typescript": "^5.9.3"
+  }
+}
