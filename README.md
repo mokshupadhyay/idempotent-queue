@@ -34,7 +34,7 @@ npm install idempotent-queue
 
 It has no dependencies. React is an optional peer dependency, used only by `idempotent-queue/react`.
 
-The library is tested with Jest in Node against simulated storage, locks, tabs, clocks and networks, against `fake-indexeddb`, and against Node's own `navigator.locks` and `BroadcastChannel` (see [Testing](#testing)). The two-tab example was run in headless Chrome. It has not been tested in Firefox or Safari, on Node 18 or 20, or in a production app yet. Please [report issues](https://github.com/mokshupadhyay/idempotent-queue/issues).
+The library is tested with Jest in Node against simulated storage, locks, tabs, clocks and networks, against `fake-indexeddb`, and against Node's own `navigator.locks` and `BroadcastChannel` (see [Testing](#testing)). Outside Jest, version 0.1.0 was checked with real tabs in Chromium, Firefox and WebKit (one sending tab; the sending tab closed mid-request and another tab finished it with the same key, applied once; items kept across a reload), and with a process killed mid-request and recovered from file storage on Node 18, 20 and 24, Bun and Deno. It has not been used in a production app yet. Please [report issues](https://github.com/mokshupadhyay/idempotent-queue/issues).
 
 ## Usage with `fetch`
 
@@ -287,7 +287,7 @@ The default `generateKey` makes a UUID v4 from the first source available:
 2. `crypto.getRandomValues()`;
 3. `Math.random()`. This fallback is not cryptographically secure. Keys are unique in practice but guessable, and a warning is logged the first time it is used.
 
-Browsers provide `crypto.randomUUID` only in secure contexts (HTTPS and `localhost`), so a plain-HTTP page uses `getRandomValues`. Node 18+ has both. `queue.keySource` and `getKeySource()` report the source (`'crypto.randomUUID'`, `'crypto.getRandomValues'`, `'Math.random'` or `'custom'`). When the server issues the key, or the request has a natural unique id (an order id), pass it as `key`.
+Browsers provide `crypto.randomUUID` only in secure contexts (HTTPS and `localhost`), so a plain-HTTP page uses `getRandomValues`. Node 20+, Bun and Deno have both. Node 18 has no global `crypto`, so the queue falls back to `Math.random()` and logs the warning; on Node 18 pass `generateKey: randomUUID` with `import { randomUUID } from 'node:crypto'`. `queue.keySource` and `getKeySource()` report the source (`'crypto.randomUUID'`, `'crypto.getRandomValues'`, `'Math.random'` or `'custom'`). When the server issues the key, or the request has a natural unique id (an order id), pass it as `key`.
 
 ### Other exports
 
