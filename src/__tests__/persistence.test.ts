@@ -4,6 +4,7 @@ import {
   checksum,
   decodeEnvelope,
   encodeEnvelope,
+  planQuarantine,
   planWrite,
   QueuePersistence,
   readQuarantine,
@@ -106,24 +107,28 @@ describe('planWrite', () => {
   it('writes the slot that does not hold the newest copy, with the next seq', () => {
     const a = encodeEnvelope([item('a')], 4);
     const b = encodeEnvelope([], 3);
-    const plan = planWrite('q', [a, b, null], (items) => items.concat([item('b', { sequence: 2 })]), 0);
+    const plan = planWrite('q', [a, b], (items) => items.concat([item('b', { sequence: 2 })]));
     expect(plan.writes.map((write) => write.key)).toEqual(['q:b']);
     expect(decodeEnvelope(plan.writes[0].value!)).toMatchObject({ ok: true, state: { seq: 5 } });
     expect(plan.base.data).toBe(JSON.stringify([item('a')]));
   });
 
   it('writes nothing when the change returns undefined', () => {
-    const plan = planWrite('q', [encodeEnvelope([item('a')], 1), null, null], () => undefined, 0);
+    const plan = planWrite('q', [encodeEnvelope([item('a')], 1), null], () => undefined);
     expect(plan.writes).toEqual([]);
     expect(plan.items).toEqual([item('a')]);
   });
 
-  it('quarantines a bad slot in the same writes, before the slot that replaces it', () => {
-    const plan = planWrite('q', ['garbage', null, null], () => [item('a')], 7);
-    expect(plan.writes.map((write) => write.key)).toEqual(['q:quarantine', 'q:a']);
-    expect(JSON.parse(plan.writes[0].value!)).toEqual([
+  it('writes only the replacement slot and returns the bad slot for a separate quarantine write', () => {
+    const plan = planWrite('q', ['garbage', null], () => [item('a')]);
+    expect(plan.writes.map((write) => write.key)).toEqual(['q:a']);
+    expect(plan.bad).toEqual([{ slot: 'a', raw: 'garbage', reason: 'envelope is not valid JSON' }]);
+    const quarantine = planQuarantine('q', null, plan.bad, 7)!;
+    expect(JSON.parse(quarantine.value)).toEqual([
       { at: 7, storageKey: 'q:a', reason: 'envelope is not valid JSON', raw: 'garbage' },
     ]);
+    // A copy that is already kept is not added again.
+    expect(planQuarantine('q', quarantine.value, plan.bad, 8)).toBeUndefined();
   });
 
   it('keeps the valid copy when the other slot is bad', () => {

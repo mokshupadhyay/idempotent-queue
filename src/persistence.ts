@@ -12,8 +12,12 @@ import type { QueueErrorKind, QueueItem, QueueItemStatus, QueueLocks, QueueStora
  *
  * On read the valid envelope with the highest `seq` wins. A slot that fails to
  * parse, has an unknown version, a wrong checksum or an invalid item is copied
- * to `<prefix>:quarantine` before it is overwritten; reading never throws for
- * bad data.
+ * to `<prefix>:quarantine` after the write that replaces it, as a separate,
+ * best-effort write: a copy that does not fit (a full localStorage) is reported
+ * and dropped, and never blocks the queue. Reading never throws for bad data.
+ *
+ * Every state is checked with the same validation as on read before it is
+ * written, so the queue never writes a slot it would quarantine itself.
  *
  * Several tabs share the slots, so every write is a read-modify-write of the
  * whole state: read both slots, apply the change to the newest copy, write the
@@ -25,6 +29,8 @@ export const DEFAULT_STORAGE_KEY = 'idempotent-queue';
 export const FORMAT = 'idempotent-queue';
 export const VERSION = 1;
 const MAX_QUARANTINE_ENTRIES = 5;
+/** Upper bound of the stored quarantine, in characters. Longer copies are truncated. */
+export const MAX_QUARANTINE_CHARS = 256 * 1024;
 
 export type Slot = 'a' | 'b';
 
@@ -38,6 +44,10 @@ export interface QuarantineEntry {
   storageKey: string;
   reason: string;
   raw: string;
+  /** Set when `raw` was cut to keep the quarantine under its size limit. */
+  truncated?: boolean;
+  /** Length of the original value, when `raw` was truncated. */
+  length?: number;
 }
 
 /** FNV-1a over UTF-16 code units, as 8 hex digits. Detects truncation and bit flips, not tampering. */
@@ -115,19 +125,53 @@ export function decodeEnvelope(raw: string): DecodeResult {
   } catch {
     return { ok: false, reason: 'data is not valid JSON' };
   }
-  if (!Array.isArray(items)) return { ok: false, reason: 'data is not an array' };
+  const reason = validateItems(items);
+  if (reason) return { ok: false, reason };
+  return { ok: true, state: { items: items as QueueItem[], seq: envelope.seq }, data: envelope.data };
+}
+
+/** Checks a parsed `data` array: every item valid, ids and keys unique. Returns a reason when invalid. */
+export function validateItems(items: unknown): string | undefined {
+  if (!Array.isArray(items)) return 'data is not an array';
   const ids = new Set<string>();
   const keys = new Set<string>();
   for (const item of items) {
     const reason = validateItem(item);
-    if (reason) return { ok: false, reason };
+    if (reason) return reason;
     const { id, key } = item as QueueItem;
-    if (ids.has(id)) return { ok: false, reason: `duplicate item id ${id}` };
-    if (keys.has(key)) return { ok: false, reason: 'duplicate idempotency key' };
+    if (ids.has(id)) return `duplicate item id ${id}`;
+    if (keys.has(key)) return 'duplicate idempotency key';
     ids.add(id);
     keys.add(key);
   }
-  return { ok: true, state: { items: items as QueueItem[], seq: envelope.seq }, data: envelope.data };
+  return undefined;
+}
+
+/** Thrown when a change would store items that fail the load validation. Nothing is written. */
+export class InvalidStateError extends Error {
+  constructor(readonly reason: string) {
+    super(`idempotent-queue: refused to write an invalid queue state (${reason})`);
+    Object.setPrototypeOf(this, InvalidStateError.prototype);
+    this.name = 'InvalidStateError';
+  }
+}
+
+/**
+ * Serializes `items` as they will be stored and checks the result with the
+ * load validation, so values JSON cannot keep (`Infinity` becomes `null`,
+ * `undefined` disappears) are caught before they are written.
+ */
+export function serializeItems(items: readonly QueueItem[]): string {
+  let data: string | undefined;
+  try {
+    data = JSON.stringify(items);
+  } catch (error) {
+    throw new InvalidStateError(`not serializable: ${String(error)}`);
+  }
+  if (data === undefined) throw new InvalidStateError('not serializable');
+  const reason = validateItems(JSON.parse(data));
+  if (reason) throw new InvalidStateError(reason);
+  return data;
 }
 
 /** The state read from the two slots. */
@@ -178,48 +222,80 @@ export interface WritePlan {
   base: ReadState;
   items: readonly QueueItem[];
   data: string;
+  /** Writes of the slot that replaces the oldest copy, if anything changed. */
   writes: StorageWrite[];
-  /** Bad slots copied to the quarantine by this plan. */
-  quarantined: Array<{ storageKey: string; reason: string }>;
+  /** Bad slots seen by this plan, to copy to the quarantine after `writes` land. */
+  bad: ReadState['bad'];
 }
 
 /**
- * Plans one read-modify-write. Pure: given the raw values of slot a, slot b
- * and the quarantine, and a change to the newest items (`undefined` for no
- * change), returns the writes. Bad slots are added to the quarantine (once
- * per raw value) in the same writes, before any slot is overwritten.
+ * Plans one read-modify-write. Pure: given the raw values of slot a and
+ * slot b, and a change to the newest items (`undefined` for no change),
+ * returns the slot write. The change must return items that pass
+ * `serializeItems`, or this throws `InvalidStateError` and nothing is written.
  */
 export function planWrite(
   prefix: string,
   raws: Array<string | null | undefined>,
   change: (items: readonly QueueItem[]) => readonly QueueItem[] | undefined,
-  now: number,
 ): WritePlan {
   const base = readSlots(raws[0], raws[1]);
   const next = change(base.items);
-  const writes: StorageWrite[] = [];
-  const quarantined: WritePlan['quarantined'] = [];
-  if (base.bad.length > 0) {
-    const entries = parseQuarantine(raws[2]);
-    for (const entry of base.bad) {
-      const storageKey = `${prefix}:${entry.slot}`;
-      if (entries.some((existing) => existing && existing.raw === entry.raw && existing.storageKey === storageKey)) continue;
-      entries.push({ at: now, storageKey, reason: entry.reason, raw: entry.raw });
-      quarantined.push({ storageKey, reason: entry.reason });
-    }
-    if (quarantined.length > 0) {
-      writes.push({ key: `${prefix}:quarantine`, value: JSON.stringify(entries.slice(-MAX_QUARANTINE_ENTRIES)) });
-    }
-  }
-  if (next === undefined) return { base, items: base.items, data: base.data, writes, quarantined };
-  const data = JSON.stringify(next);
+  if (next === undefined) return { base, items: base.items, data: base.data, writes: [], bad: base.bad };
+  const data = serializeItems(next);
   // Write the slot that does not hold the newest copy. With no valid copy,
-  // overwrite a corrupted slot first (it is quarantined above), keeping any other.
+  // overwrite a corrupted slot first, keeping any other.
   let slot: Slot;
   if (base.slot) slot = base.slot === 'a' ? 'b' : 'a';
   else slot = base.bad.length === 1 ? base.bad[0].slot : 'a';
-  writes.push({ key: `${prefix}:${slot}`, value: encodeData(data, base.seq + 1) });
-  return { base, items: next, data, writes, quarantined };
+  const encoded = encodeData(data, base.seq + 1);
+  return { base, items: next, data, writes: [{ key: `${prefix}:${slot}`, value: encoded }], bad: base.bad };
+}
+
+/**
+ * Adds bad slots to the stored quarantine. Returns the new quarantine value
+ * and the entries added, or `undefined` when every copy is already kept. The
+ * value holds at most `MAX_QUARANTINE_ENTRIES` entries and
+ * `MAX_QUARANTINE_CHARS` characters; older entries go first, then long copies
+ * are truncated.
+ */
+export function planQuarantine(
+  prefix: string,
+  existingRaw: string | null | undefined,
+  bad: ReadState['bad'],
+  now: number,
+): { value: string; added: Array<{ storageKey: string; reason: string }> } | undefined {
+  let entries = parseQuarantine(existingRaw);
+  const added: Array<{ storageKey: string; reason: string }> = [];
+  for (const entry of bad) {
+    const storageKey = `${prefix}:${entry.slot}`;
+    if (entries.some((existing) => existing && existing.storageKey === storageKey && sameRaw(existing, entry.raw))) continue;
+    entries.push({ at: now, storageKey, reason: entry.reason, raw: entry.raw });
+    added.push({ storageKey, reason: entry.reason });
+  }
+  if (added.length === 0) return undefined;
+  entries = entries.slice(-MAX_QUARANTINE_ENTRIES);
+  let value = JSON.stringify(entries);
+  while (value.length > MAX_QUARANTINE_CHARS && entries.length > 1) {
+    entries = entries.slice(1);
+    value = JSON.stringify(entries);
+  }
+  if (value.length > MAX_QUARANTINE_CHARS) {
+    // One copy alone is too long: keep its beginning. JSON escaping can make the cut longer, so halve until it fits.
+    const only = entries[0];
+    let keep = MAX_QUARANTINE_CHARS - 512;
+    do {
+      value = JSON.stringify([{ ...only, raw: only.raw.slice(0, keep), truncated: true, length: only.raw.length }]);
+      keep = Math.floor(keep / 2);
+    } while (value.length > MAX_QUARANTINE_CHARS);
+  }
+  return { value, added };
+}
+
+/** A truncated copy matches the raw value it was cut from. */
+function sameRaw(entry: QuarantineEntry, raw: string): boolean {
+  if (entry.truncated) return typeof entry.raw === 'string' && entry.length === raw.length && raw.startsWith(entry.raw);
+  return entry.raw === raw;
 }
 
 /** A change applied inside a transaction. Must not have side effects: it may run more than once. */
@@ -237,7 +313,8 @@ export interface PersistenceHooks {
   onCommit(commit: Commit): void;
   /** Runs after `clear()` removed the stored data. */
   onCleared(): void;
-  onQuarantine(reason: string, storageKey: string): void;
+  /** A bad slot was found. `saved` tells whether its copy reached the quarantine. */
+  onQuarantine(reason: string, storageKey: string, saved: boolean): void;
   onStorageError(error: unknown): void;
   now(): number;
 }
@@ -274,9 +351,12 @@ export class QueuePersistence {
     return `${this.prefix}:storage`;
   }
 
-  private get keys(): string[] {
-    return [this.slotKey('a'), this.slotKey('b'), this.quarantineKey];
+  private get slotKeys(): string[] {
+    return [this.slotKey('a'), this.slotKey('b')];
   }
+
+  /** Bad slot values this instance already tried to quarantine, so a failing copy is not retried on every write. */
+  private readonly quarantineTried = new Set<string>();
 
   /**
    * Reads the newest state without writing. Each slot holds a whole committed
@@ -297,7 +377,7 @@ export class QueuePersistence {
       await this.transact(() => ({ result: undefined }));
       return await this.read();
     } catch (error) {
-      for (const entry of state.bad) this.hooks.onQuarantine(entry.reason, this.slotKey(entry.slot));
+      for (const entry of state.bad) this.hooks.onQuarantine(entry.reason, this.slotKey(entry.slot), false);
       this.hooks.onStorageError(error);
       return state;
     }
@@ -346,20 +426,41 @@ export class QueuePersistence {
     }
   }
 
+  /**
+   * Removes both slots and the quarantine. With an atomic `update` this is
+   * one step. Without one, a crash between two removals must not bring an
+   * older copy back, so the steps are: write an empty state with a higher
+   * `seq` to the slot that does not hold the newest copy (from then on the
+   * empty state wins), remove the newest copy, remove the empty state, and
+   * remove the quarantine. Stopping after any step leaves the queue either
+   * as it was or empty.
+   */
   private async runClear(entry: Extract<Entry, { kind: 'clear' }>): Promise<void> {
-    const keys = this.keys;
+    const keys = this.slotKeys.concat([this.quarantineKey]);
     try {
       if (typeof this.storage.update === 'function') {
         await this.storage.update(keys, () => keys.map((key) => ({ key, value: null })));
       } else {
         await this.locks.request(this.lockName, async () => {
-          for (const key of keys) await this.storage.removeItem(key);
+          const [rawA, rawB] = await Promise.all(this.slotKeys.map((key) => this.storage.getItem(key)));
+          const state = readSlots(rawA, rawB);
+          if (state.slot) {
+            const empty: Slot = state.slot === 'a' ? 'b' : 'a';
+            await this.storage.setItem(this.slotKey(empty), encodeData(EMPTY_DATA, state.seq + 1));
+            await this.storage.removeItem(this.slotKey(state.slot));
+            await this.storage.removeItem(this.slotKey(empty));
+          } else {
+            // No valid copy, so nothing older can win: remove whatever is there.
+            for (const key of this.slotKeys) await this.storage.removeItem(key);
+          }
+          await this.storage.removeItem(this.quarantineKey);
         });
       }
     } catch (error) {
       entry.reject(error);
       return;
     }
+    this.quarantineTried.clear();
     this.hooks.onCleared();
     entry.resolve(undefined);
   }
@@ -368,41 +469,36 @@ export class QueuePersistence {
     type Outcome = { ok: true; result: unknown } | { ok: false; error: unknown };
     let outcomes: Outcome[] = [];
     let plan: WritePlan | undefined;
-    const now = this.hooks.now();
     const prepare = (raws: Array<string | null | undefined>): StorageWrite[] => {
       outcomes = [];
-      plan = planWrite(
-        this.prefix,
-        raws,
-        (items) => {
-          let current = items;
-          let changed = false;
-          for (const entry of batch) {
-            try {
-              const out = entry.mutator(current);
-              if (out.items) {
-                current = out.items;
-                changed = true;
-              }
-              outcomes.push({ ok: true, result: out.result });
-            } catch (error) {
-              outcomes.push({ ok: false, error });
+      plan = planWrite(this.prefix, raws, (items) => {
+        let current = items;
+        let changed = false;
+        for (const entry of batch) {
+          try {
+            const out = entry.mutator(current);
+            if (out.items) {
+              // A change that would store an invalid state is refused on its own; the rest of the batch goes on.
+              serializeItems(out.items);
+              current = out.items;
+              changed = true;
             }
+            outcomes.push({ ok: true, result: out.result });
+          } catch (error) {
+            outcomes.push({ ok: false, error });
           }
-          return changed ? current : undefined;
-        },
-        now,
-      );
+        }
+        return changed ? current : undefined;
+      });
       return plan.writes;
     };
 
     try {
       if (typeof this.storage.update === 'function') {
-        await this.storage.update(this.keys, (values) => prepare(values));
+        await this.storage.update(this.slotKeys, (values) => prepare(values));
       } else {
         await this.locks.request(this.lockName, async () => {
-          const raws = await Promise.all(this.keys.map((key) => this.storage.getItem(key)));
-          // The quarantine comes first in the writes, so bad data is copied before it is overwritten.
+          const raws = await Promise.all(this.slotKeys.map((key) => this.storage.getItem(key)));
           for (const write of prepare(raws)) {
             if (write.value === null) await this.storage.removeItem(write.key);
             else await this.storage.setItem(write.key, write.value);
@@ -418,13 +514,50 @@ export class QueuePersistence {
       batch.forEach((entry) => entry.reject(new Error('storage.update did not call mutate')));
       return;
     }
-    committed.quarantined.forEach(({ reason, storageKey }) => this.hooks.onQuarantine(reason, storageKey));
     this.hooks.onCommit({ baseData: committed.base.data, items: committed.items, data: committed.data });
+    if (committed.bad.length > 0) await this.saveQuarantine(committed.bad);
     batch.forEach((entry, index) => {
       const outcome = outcomes[index];
       if (outcome.ok) entry.resolve(outcome.result);
       else entry.reject(outcome.error);
     });
+  }
+
+  /**
+   * Copies bad slots to the quarantine, after the write that replaced them.
+   * Best effort: a failure (for example a full localStorage) is reported with
+   * `saved: false` and a storage error, and never fails the write itself.
+   */
+  private async saveQuarantine(bad: ReadState['bad']): Promise<void> {
+    const fresh = bad.filter((entry) => {
+      const id = `${entry.slot}:${entry.raw.length}:${checksum(entry.raw)}`;
+      if (this.quarantineTried.has(id)) return false;
+      this.quarantineTried.add(id);
+      return true;
+    });
+    if (fresh.length === 0) return;
+    const key = this.quarantineKey;
+    let added: Array<{ storageKey: string; reason: string }> = [];
+    const plan = (existing: string | null | undefined): StorageWrite[] => {
+      const next = planQuarantine(this.prefix, existing, fresh, this.hooks.now());
+      added = next ? next.added : [];
+      return next ? [{ key, value: next.value }] : [];
+    };
+    try {
+      if (typeof this.storage.update === 'function') {
+        await this.storage.update([key], (values) => plan(values[0]));
+      } else {
+        await this.locks.request(this.lockName, async () => {
+          const writes = plan(await this.storage.getItem(key));
+          for (const write of writes) await this.storage.setItem(write.key, write.value as string);
+        });
+      }
+    } catch (error) {
+      fresh.forEach((entry) => this.hooks.onQuarantine(entry.reason, this.slotKey(entry.slot), false));
+      this.hooks.onStorageError(error);
+      return;
+    }
+    added.forEach(({ reason, storageKey }) => this.hooks.onQuarantine(reason, storageKey, true));
   }
 }
 

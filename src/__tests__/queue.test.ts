@@ -224,7 +224,7 @@ describe('sending', () => {
     await tick();
     expect(calls).toHaveLength(1);
     expect(calls[0].item.payload).toEqual({ amount: 5 });
-    expect(calls[0].context).toEqual({ key: 'k', attempt: 1 });
+    expect(calls[0].context).toMatchObject({ key: 'k', attempt: 1 });
     expect(queue.getItems()[0].status).toBe('inflight');
     calls[0].resolve({ id: 'receipt' });
     await tick();
@@ -246,7 +246,7 @@ describe('sending', () => {
     expect(calls).toHaveLength(1);
     await clock.advance(1);
     expect(calls).toHaveLength(2);
-    expect(calls[1].context).toEqual({ key: 'k', attempt: 2 });
+    expect(calls[1].context).toMatchObject({ key: 'k', attempt: 2 });
     calls[1].reject(new HttpError(503));
     await tick();
     expect(queue.getItems()[0].nextAttemptAt).toBe(500 + 1000);
@@ -270,7 +270,7 @@ describe('sending', () => {
     expect(retried).toMatchObject({ status: 'pending', attempts: 0, key: 'k' });
     await tick();
     expect(calls).toHaveLength(4);
-    expect(calls[3].context).toEqual({ key: 'k', attempt: 1 });
+    expect(calls[3].context).toMatchObject({ key: 'k', attempt: 1 });
   });
 
   it('marks an item dead on a permanent error and never retries it', async () => {
@@ -398,7 +398,7 @@ describe('ordering and concurrency', () => {
     expect(Array.from(open).map((call) => call.context.key).sort()).toEqual(['free', 'other']);
     await clock.advance(10000);
     const retry = calls[calls.length - 1];
-    expect(retry.context).toEqual({ key: 'acct-1', attempt: 2 });
+    expect(retry.context).toMatchObject({ key: 'acct-1', attempt: 2 });
     retry.resolve();
     await tick();
     expect(calls[calls.length - 1].context.key).toBe('acct-2');
@@ -407,15 +407,20 @@ describe('ordering and concurrency', () => {
     expect(calls[calls.length - 1].context.key).toBe('acct-3');
   });
 
-  it('lets a group continue after its head is dead', async () => {
+  it('holds a group back while its head is dead, until the head is retried', async () => {
     const { queue, calls, tick } = harness();
     await queue.start();
-    await queue.enqueue({ payload: 1, key: 'a', group: 'g' });
+    const head = await queue.enqueue({ payload: 1, key: 'a', group: 'g' });
     await queue.enqueue({ payload: 2, key: 'b', group: 'g' });
     await tick();
     calls[0].reject(new HttpError(400));
     await tick();
-    expect(calls.map((call) => call.context.key)).toEqual(['a', 'b']);
+    expect(calls.map((call) => call.context.key)).toEqual(['a']);
+    await queue.retry(head.id);
+    await tick();
+    calls[1].resolve();
+    await tick();
+    expect(calls.map((call) => call.context.key)).toEqual(['a', 'a', 'b']);
   });
 });
 
@@ -469,7 +474,7 @@ describe('start, stop and recovery', () => {
     expect(second.events.find((event) => event.type === 'updated')).toMatchObject({
       item: { status: 'pending', attempts: 1, key: 'pay-1' },
     });
-    expect(second.calls[0].context).toEqual({ key: 'pay-1', attempt: 2 });
+    expect(second.calls[0].context).toMatchObject({ key: 'pay-1', attempt: 2 });
   });
 
   it('marks an item interrupted on its last allowed attempt as failed', async () => {
@@ -551,6 +556,8 @@ describe('long waits', () => {
         return 'ok';
       },
       now: () => clock.now,
+      // Only the wake-up timers are counted here.
+      attemptTimeoutMs: Infinity,
       timers: {
         setTimeout: (callback, ms) => {
           delays.push(ms);

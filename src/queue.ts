@@ -7,6 +7,7 @@ import { getKeySource, uuidV4, validateKey } from './keys.js';
 import { createBroadcastChannelLocks, createMemoryLocks, createWebLocks, getLockManager } from './locks.js';
 import { DEFAULT_STORAGE_KEY, QueuePersistence, type Mutator } from './persistence.js';
 import { createIndexedDBStorage, createMemoryStorage, isMemoryStorage } from './storage.js';
+import { timerDelay } from './timers.js';
 import type {
   AbortSignalLike,
   EnqueueInput,
@@ -24,12 +25,17 @@ import type {
   QueueOptions,
   QueueStorage,
   QueueTimers,
+  SendContext,
+  StopOptions,
 } from './types.js';
 
 const HOUR = 60 * 60 * 1000;
 /** Longer waits are split into wake-ups of at most a minute, so a suspended laptop catches up soon after it wakes. */
 const MAX_TIMER_DELAY = 60 * 1000;
 const MAX_ERROR_MESSAGE = 500;
+/** A classifier delay above this is not a real wait (a bug, or `Retry-After` in the far future) and becomes `maxDelayMs`. */
+const MAX_CLASSIFIED_DELAY_MS = 7 * 24 * HOUR;
+const DEFAULT_ATTEMPT_TIMEOUT_MS = 30 * 1000;
 const LOG_PREFIX = '[idempotent-queue]';
 
 const defaultTimers: QueueTimers = {
@@ -77,13 +83,23 @@ function toItemError(kind: QueueErrorKind, error: unknown, at: number): QueueIte
   return result;
 }
 
-function isClassification(value: unknown): value is ErrorClassification {
-  if (!value || typeof value !== 'object') return false;
+/**
+ * Checks a classifier's answer and makes its delay safe to store: below 0
+ * becomes 0, `Infinity` or more than `MAX_CLASSIFIED_DELAY_MS` becomes
+ * `maxDelayMs`. `NaN` (or a delay that is not a number) drops the delay, so
+ * the normal backoff applies; a `rateLimited` answer without a usable delay
+ * becomes `retryable`. Anything else that is not a classification is
+ * `undefined`, which the queue treats as retryable.
+ */
+export function normalizeClassification(value: unknown, maxDelayMs: number): ErrorClassification | undefined {
+  if (!value || typeof value !== 'object') return undefined;
   const { type, delayMs } = value as { type?: unknown; delayMs?: unknown };
-  if (type === 'permanent') return true;
-  if (type === 'retryable') return delayMs === undefined || (typeof delayMs === 'number' && !Number.isNaN(delayMs));
-  if (type === 'rateLimited') return typeof delayMs === 'number' && !Number.isNaN(delayMs);
-  return false;
+  if (type === 'permanent') return { type };
+  if (type !== 'retryable' && type !== 'rateLimited') return undefined;
+  if (typeof delayMs !== 'number' || Number.isNaN(delayMs)) return { type: 'retryable' };
+  let delay = delayMs < 0 ? 0 : delayMs;
+  if (delay > MAX_CLASSIFIED_DELAY_MS) delay = maxDelayMs;
+  return { type, delayMs: delay };
 }
 
 function checkCount(name: string, value: number | undefined, fallback: number, min: number, integer: boolean): number {
@@ -173,10 +189,16 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
   const keepSucceededMs = checkCount('keepSucceededMs', options.keepSucceededMs, 24 * HOUR, 0, false);
   const offlineRecheckMs = checkCount('offlineRecheckMs', options.offlineRecheckMs, 5000, 1, false);
   const syncIntervalMs = checkCount('syncIntervalMs', options.syncIntervalMs, 2000, 1, false);
+  const attemptTimeoutMs = checkCount('attemptTimeoutMs', options.attemptTimeoutMs, DEFAULT_ATTEMPT_TIMEOUT_MS, 1, false);
   const prefix = options.storageKey || DEFAULT_STORAGE_KEY;
   const now = options.now || (() => Date.now());
   const random = options.random || Math.random;
-  const timers = options.timers || defaultTimers;
+  const rawTimers = options.timers || defaultTimers;
+  /** Every timer goes through `timerDelay`, so no delay overflows `setTimeout`. */
+  const timers: QueueTimers = {
+    setTimeout: (callback, ms) => rawTimers.setTimeout(callback, timerDelay(ms)),
+    clearTimeout: (handle) => rawTimers.clearTimeout(handle),
+  };
   const classify = options.classifyError || defaultClassifyError;
   const generateKey = options.generateKey || uuidV4;
   const keySource: KeySource = options.generateKey ? 'custom' : getKeySource();
@@ -209,7 +231,11 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
   let sender = false;
   let resign: (() => void) | undefined;
   let generation = 0;
+  /** Increases with every `start()`, so a start overtaken by a stop and another start does nothing more. */
+  let startToken = 0;
   let abortSender: AbortControllerLike | undefined;
+  /** Aborts for this tab's attempts in flight, used by `stop({ abortAfterMs })`. */
+  const attemptAborts = new Set<(reason: 'stop') => void>();
 
   /** Keys with a request in flight from this tab, including one whose item was discarded. */
   const inflightKeys = new Set<string>();
@@ -307,7 +333,7 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
       setCache([], '[]');
       postChanged();
     },
-    onQuarantine: (reason, storageKey) => emit({ type: 'quarantined', reason, storageKey }),
+    onQuarantine: (reason, storageKey, saved) => emit({ type: 'quarantined', reason, storageKey, saved }),
     onStorageError: (error) => emit({ type: 'storage-error', error }),
     now,
   });
@@ -568,6 +594,11 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
       if (item.status === 'inflight' && item.group !== undefined) blockedGroups.add(item.group);
     });
     snapshot.forEach((item) => {
+      // A failed or dead item holds back the later items of its group until it is retried or discarded.
+      if ((item.status === 'failed' || item.status === 'dead') && item.group !== undefined) {
+        blockedGroups.add(item.group);
+        return;
+      }
       if (item.status !== 'pending') return;
       if (item.group !== undefined) {
         // Only the oldest pending item of a group may go, and only when none is in flight.
@@ -653,7 +684,9 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
           (other) =>
             other.id !== id &&
             other.group === item.group &&
-            (other.status === 'inflight' || (other.status === 'pending' && other.sequence < item.sequence)),
+            (other.status === 'inflight' ||
+              (other.sequence < item.sequence &&
+                (other.status === 'pending' || other.status === 'failed' || other.status === 'dead'))),
         )
       ) {
         return { result: undefined };
@@ -675,13 +708,59 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
     };
   }
 
+  /**
+   * Calls `send` with an `AbortSignal`, and resolves with its outcome, or with
+   * `aborted` when the attempt times out or `stop()` gives up on it. The key
+   * stays in `inflightKeys` until `send` itself settles, even after an abort,
+   * so this tab never has two requests with one key in flight.
+   */
+  function callSend(
+    item: Item,
+  ): Promise<{ value: TResult } | { error: unknown } | { aborted: 'timeout' | 'stop' }> {
+    const controller = createAbortController();
+    const context: SendContext = { key: item.key, attempt: item.attempts };
+    if (controller) context.signal = controller.signal;
+    let sent: Promise<TResult>;
+    try {
+      sent = Promise.resolve(send(item, context));
+    } catch (error) {
+      sent = Promise.reject(error);
+    }
+    const releaseKey = () => {
+      inflightKeys.delete(item.key);
+      schedulePump();
+    };
+    sent.then(releaseKey, releaseKey);
+    return new Promise((resolve) => {
+      let done = false;
+      let timeout: unknown;
+      const finish = (outcome: { value: TResult } | { error: unknown } | { aborted: 'timeout' | 'stop' }) => {
+        if (done) return;
+        done = true;
+        if (timeout !== undefined) timers.clearTimeout(timeout);
+        attemptAborts.delete(abort);
+        resolve(outcome);
+        if ('aborted' in outcome && controller) controller.abort();
+      };
+      const abort = (reason: 'timeout' | 'stop') => finish({ aborted: reason });
+      attemptAborts.add(abort);
+      if (attemptTimeoutMs !== Infinity) timeout = timers.setTimeout(() => abort('timeout'), attemptTimeoutMs);
+      sent.then(
+        (value) => finish({ value }),
+        (error: unknown) => finish({ error }),
+      );
+    });
+  }
+
   async function runAttempt(candidate: Item, t: number): Promise<void> {
     let released = false;
+    let keyHeld = true;
     const release = () => {
       if (released) return;
       released = true;
       active--;
-      inflightKeys.delete(candidate.key);
+      // When `send` was called, the key is released when it settles (see `callSend`).
+      if (keyHeld) inflightKeys.delete(candidate.key);
       ownIds.delete(candidate.id);
       if (candidate.group !== undefined) busyGroups.delete(candidate.group);
       schedulePump();
@@ -719,31 +798,40 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
         return;
       }
 
-      let result: TResult | undefined;
-      let failure: { error: unknown } | undefined;
-      try {
-        result = await send(item, { key: item.key, attempt: item.attempts });
-      } catch (error) {
-        failure = { error };
-      }
+      keyHeld = false;
+      const outcome = await callSend(item);
 
       const at = now();
       let change: (stored: QueueItem) => QueueItem;
       let toEvent: (next: Item) => Event;
-      if (!failure) {
+      if ('value' in outcome) {
+        const result = outcome.value;
         change = (stored) => {
           const { lastError: _ignored, ...rest } = stored;
           return { ...rest, status: 'succeeded', updatedAt: at, nextAttemptAt: at, completedAt: at };
         };
-        toEvent = (next) => ({ type: 'succeeded', item: next, result: result as TResult });
+        toEvent = (next) => ({ type: 'succeeded', item: next, result });
       } else {
-        const { error } = failure;
+        let error: unknown;
         let decision: ErrorClassification;
-        try {
-          const value: unknown = classify(error, { item, attempt: item.attempts, now: at });
-          decision = isClassification(value) ? value : { type: 'retryable' };
-        } catch {
-          decision = { type: 'retryable' };
+        if ('aborted' in outcome) {
+          // The request may or may not have reached the server, as with a lost response:
+          // retryable, with the same key. After stop(), it is due at once for the next sending tab.
+          error =
+            outcome.aborted === 'timeout'
+              ? Object.assign(new Error(`The attempt did not settle within ${attemptTimeoutMs} ms and was aborted.`), {
+                  name: 'TimeoutError',
+                })
+              : Object.assign(new Error('stop() aborted the attempt.'), { name: 'AbortError' });
+          decision = outcome.aborted === 'stop' ? { type: 'retryable', delayMs: 0 } : { type: 'retryable' };
+        } else {
+          error = outcome.error;
+          try {
+            const value: unknown = classify(error, { item, attempt: item.attempts, now: at });
+            decision = normalizeClassification(value, policy.maxDelayMs) || { type: 'retryable' };
+          } catch {
+            decision = { type: 'retryable' };
+          }
         }
         if (decision.type === 'permanent') {
           change = (stored) => ({ ...stored, status: 'dead', updatedAt: at, lastError: toItemError('permanent', error, at) });
@@ -754,8 +842,7 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
           toEvent = (next) => ({ type: 'failed', item: next, error });
         } else {
           const kind = decision.type;
-          const delayMs =
-            decision.delayMs !== undefined ? Math.max(0, decision.delayMs) : backoffDelay(item.attempts, policy, random);
+          const delayMs = decision.delayMs !== undefined ? decision.delayMs : backoffDelay(item.attempts, policy, random);
           change = (stored) => ({
             ...stored,
             status: 'pending',
@@ -806,6 +893,7 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
   }
 
   function subscribeChannel(): void {
+    if (unsubscribeChannel) return;
     const target = resolveChannel();
     if (target) {
       unsubscribeChannel = target.subscribe((message) => {
@@ -817,6 +905,7 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
   async function start(): Promise<void> {
     if (running) return load();
     running = true;
+    const token = ++startToken;
     if (subscribeToConnectivity && !unsubscribeConnectivity) {
       unsubscribeConnectivity = subscribeToConnectivity((value) => {
         online = value !== false;
@@ -826,16 +915,19 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
     try {
       await load();
     } catch (error) {
-      running = false;
-      unsubscribeAll();
+      if (token === startToken) {
+        running = false;
+        unsubscribeAll();
+      }
       throw error;
     }
-    if (!running) return;
+    // A stop(), or a stop() and another start(), ran while loading: that later call owns the setup.
+    if (!running || token !== startToken) return;
     subscribeChannel();
     // Catch changes made by other tabs between the load and the subscription.
     refresh();
     scheduleSync();
-    if (subscribeToVisibility) {
+    if (subscribeToVisibility && !unsubscribeVisibility) {
       unsubscribeVisibility = subscribeToVisibility(() => {
         flush().then(undefined, (error: unknown) => emit({ type: 'storage-error', error }));
       });
@@ -854,15 +946,29 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
     syncTimer = undefined;
   }
 
-  async function stop(): Promise<void> {
+  async function stop(stopOptions?: StopOptions): Promise<void> {
+    const abortAfterMs =
+      stopOptions && stopOptions.abortAfterMs !== undefined
+        ? checkCount('stop: abortAfterMs', stopOptions.abortAfterMs, 0, 0, false)
+        : Infinity;
     running = false;
+    startToken++;
     generation++;
     if (abortSender) abortSender.abort();
     abortSender = undefined;
     clearTimer();
     unsubscribeAll();
     // Keep the sender lock until this tab's attempts have settled, so no other tab sends them meanwhile.
+    // With `abortAfterMs`, attempts still running after that long are aborted and recorded as retryable.
+    let grace: unknown;
+    if (tasks.size > 0 && abortAfterMs !== Infinity) {
+      grace = timers.setTimeout(() => {
+        grace = undefined;
+        Array.from(attemptAborts).forEach((abort) => abort('stop'));
+      }, abortAfterMs);
+    }
     while (tasks.size > 0) await Promise.all(Array.from(tasks));
+    if (grace !== undefined) timers.clearTimeout(grace);
     // Hand the lock on even when `start()` ran meanwhile: its own request is waiting for this lock.
     if (sender) {
       sender = false;
@@ -924,6 +1030,8 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
     });
     if (!removed) return false;
     emit({ type: 'removed', item: removed });
+    // Removing a failed or dead item can let the rest of its group go.
+    schedulePump();
     return true;
   }
 
@@ -935,7 +1043,16 @@ export function createIdempotentQueue<TPayload = unknown, TResult = unknown>(
     } catch {
       // Unreadable storage is removed below anyway.
     }
-    await persistence.clear();
+    try {
+      await persistence.clear();
+    } catch (error) {
+      // Storage may be partly cleared (it is then empty or unchanged); read it again before the next change.
+      loaded = false;
+      loading = undefined;
+      knownData = undefined;
+      if (wasRunning) await start().then(undefined, () => undefined);
+      throw error;
+    }
     loaded = true;
     emit({ type: 'cleared' });
     if (wasRunning) await start();

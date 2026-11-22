@@ -134,6 +134,23 @@ export interface SendContext {
   key: string;
   /** 1 for the first attempt, 2 for the first retry, and so on. */
   attempt: number;
+  /**
+   * Aborted when the attempt runs longer than `attemptTimeoutMs`, or when
+   * `stop({ abortAfterMs })` gives up waiting. Pass it to `fetch` (as
+   * `fetchSender` does) so the request is cancelled. Present wherever the
+   * host has `AbortController` (every current browser, Node 16+).
+   */
+  signal?: AbortSignalLike;
+}
+
+export interface StopOptions {
+  /**
+   * How long `stop()` waits for attempts in flight before it aborts them.
+   * An aborted attempt counts as a retryable failure: the item goes back to
+   * `pending`, due now, with the same key. Default: no limit, so `stop()`
+   * waits until each attempt settles or reaches `attemptTimeoutMs`.
+   */
+  abortAfterMs?: number;
 }
 
 /** The classifier's decision about an error thrown by `send`. */
@@ -204,8 +221,20 @@ export interface QueueOptions<TPayload = unknown, TResult = unknown> {
    * other tabs' changes. Default 2000.
    */
   syncIntervalMs?: number;
-  /** Default: `defaultClassifyError`, for HTTP-like and network errors. */
+  /**
+   * Default: `defaultClassifyError`, for HTTP-like and network errors. A
+   * `delayMs` below 0 counts as 0; `NaN` is ignored (the normal backoff
+   * applies); `Infinity` or more than 7 days becomes `retry.maxDelayMs`.
+   */
   classifyError?: ErrorClassifier<TPayload>;
+  /**
+   * How long one attempt may run. After that its `signal` is aborted and the
+   * attempt counts as a retryable failure (same key, so a duplicate is safe
+   * on a server that honours it). A `send` that ignores the signal keeps the
+   * key blocked in this tab until it settles. Default 30000; `Infinity`
+   * turns the limit off.
+   */
+  attemptTimeoutMs?: number;
   retry?: RetryPolicy;
   /**
    * Checked before sending. Offline items wait without using attempts.
@@ -274,7 +303,12 @@ export type QueueEvent<TPayload = unknown, TResult = unknown> =
   | { type: 'storage-error'; error: unknown }
   /** The sender lock could not be requested, so this tab cannot send. */
   | { type: 'lock-error'; error: unknown }
-  | { type: 'quarantined'; reason: string; storageKey: string };
+  /**
+   * Unreadable data was found at `storageKey` and replaced. `saved` tells
+   * whether a copy reached `<storageKey prefix>:quarantine` (best effort: a
+   * copy that does not fit is dropped and also reported as a `storage-error`).
+   */
+  | { type: 'quarantined'; reason: string; storageKey: string; saved: boolean };
 
 export type QueueListener<TPayload = unknown, TResult = unknown> = (
   event: QueueEvent<TPayload, TResult>,
@@ -291,8 +325,11 @@ export interface IdempotentQueue<TPayload = unknown, TResult = unknown> {
    * wait and take over when it closes or stops.
    */
   start(): Promise<void>;
-  /** Stops starting new attempts, waits for the attempts in flight, then hands the sender lock on. */
-  stop(): Promise<void>;
+  /**
+   * Stops starting new attempts, waits for the attempts in flight (or aborts
+   * them after `options.abortAfterMs`), then hands the sender lock on.
+   */
+  stop(options?: StopOptions): Promise<void>;
   /**
    * Makes waiting items due now (except items waiting for a server's
    * `Retry-After`). In the sending tab, resolves when nothing is in flight or

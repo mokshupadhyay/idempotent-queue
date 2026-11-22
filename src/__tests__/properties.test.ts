@@ -1,6 +1,9 @@
 import fc from 'fast-check';
+import { createMemoryLocks } from '../locks';
+import { decodeEnvelope, QueuePersistence, readSlots } from '../persistence';
 import { createIdempotentQueue } from '../queue';
-import type { QueueItem } from '../types';
+import { createMemoryStorage } from '../storage';
+import type { ErrorClassification, QueueItem } from '../types';
 import { World, type Fault, type Payload, type WorldConfig } from './support/world';
 
 /*
@@ -81,18 +84,30 @@ async function settle(world: World, done: () => boolean): Promise<void> {
 /** Tab slot an op targets: always 0 in single-tab worlds. */
 const slotOf = (world: World, op: Op) => (('tab' in op && op.tab) || 0) % world.tabs.length;
 
-function enqueue(world: World, slot: number, key: number, n: number, confirmed?: Set<string>) {
+function enqueue(world: World, slot: number, key: number, n: number, confirmed?: Set<string>, rejected?: unknown[]) {
   const name = keyName(key);
   const group = groupOf(key);
   world.tabs[slot].queue
     .enqueue({ payload: { key: name, n }, key: name, ...(group ? { group } : {}) })
     .then(
       () => confirmed && confirmed.add(name),
-      () => undefined,
+      (error: unknown) => rejected && rejected.push(error),
     );
 }
 
 const terminal = (item: QueueItem) => item.status !== 'pending' && item.status !== 'inflight';
+
+/** A pending item that waits behind a failed or dead item of its group, until that one is retried or discarded. */
+const heldBack = (item: QueueItem, items: readonly QueueItem[]) =>
+  item.status === 'pending' &&
+  item.group !== undefined &&
+  items.some(
+    (other) =>
+      other.group === item.group && other.sequence < item.sequence && (other.status === 'failed' || other.status === 'dead'),
+  );
+
+/** Nothing more will happen without the app: every item is terminal or held back by its group. */
+const quiet = (items: readonly QueueItem[]) => items.every((item) => terminal(item) || heldBack(item, items));
 
 describe('property 1: every enqueued key is applied exactly once and ends succeeded', () => {
   it('holds across crashes, offline periods and lost responses', async () => {
@@ -117,20 +132,22 @@ describe('property 1: every enqueued key is applied exactly once and ends succee
           /** Keys the app asked for, and the payload it used first. */
           const requested = new Map<string, number>();
           const confirmed = new Set<string>();
+          /** Storage never fails here, so no enqueue may reject, including a repeat of a key. */
+          const rejected: unknown[] = [];
           let n = 0;
           for (const op of ops) {
             if (op.t === 'enqueue') {
               const name = keyName(op.key);
               seen.hit('duplicateEnqueue', requested.has(name));
               if (!requested.has(name)) requested.set(name, n);
-              enqueue(world, 0, op.key, n++, confirmed);
+              enqueue(world, 0, op.key, n++, confirmed, rejected);
             } else if (op.t === 'crash') {
               seen.hit('lostUnconfirmedEnqueue', Array.from(requested.keys()).some((key) => !confirmed.has(key)));
               world.crash();
               void world.process.queue.start();
               // An app re-enqueues, with the same key, anything it was not told was saved.
               requested.forEach((first, name) => {
-                if (!confirmed.has(name)) enqueue(world, 0, Number(name.slice(4)), first, confirmed);
+                if (!confirmed.has(name)) enqueue(world, 0, Number(name.slice(4)), first, confirmed, rejected);
               });
             } else if (op.t === 'offline') world.setOnline(false);
             else if (op.t === 'online') world.setOnline(true);
@@ -150,6 +167,7 @@ describe('property 1: every enqueued key is applied exactly once and ends succee
           await settle(world, allSucceeded);
 
           const items = world.process.queue.getItems();
+          expect(rejected.map(String)).toEqual([]);
           for (const key of requested.keys()) {
             expect(confirmed.has(key)).toBe(true);
             expect(world.server.applied.get(key)).toBe(1);
@@ -228,7 +246,7 @@ describe('property 2: the same key is never in flight twice at the same time', (
             seen.hit('parallelDifferentKeys', queue.getItems().filter((item) => item.status === 'inflight').length > 1);
           }
           world.setOnline(true);
-          await settle(world, () => queue.getItems().every(terminal));
+          await settle(world, () => quiet(queue.getItems()));
           expect(world.maxSameKeyInFlight).toBeLessThanOrEqual(1);
         },
       ),
@@ -240,7 +258,7 @@ describe('property 2: the same key is never in flight twice at the same time', (
 
 describe('property 3: permanent errors are never retried; retryable errors use at most maxAttempts', () => {
   it('holds for any mix of errors, offline periods and stop/start', async () => {
-    const seen = coverage('dead', 'failed', 'succeededAfterRetry', 'rateLimited');
+    const seen = coverage('dead', 'failed', 'succeededAfterRetry', 'rateLimited', 'heldBackByGroup');
     await fc.assert(
       fc.asyncProperty(
         worldConfig(anyFault, fc.integer({ min: 1, max: 4 })),
@@ -276,10 +294,14 @@ describe('property 3: permanent errors are never retried; retryable errors use a
           }
           world.setOnline(true);
           void queue.start();
-          await settle(world, () => queue.getItems().every(terminal));
+          await settle(world, () => quiet(queue.getItems()));
 
-          for (const item of queue.getItems()) {
-            expect(terminal(item)).toBe(true);
+          const items = queue.getItems();
+          for (const item of items) {
+            // An item behind a failed or dead item of its group is never sent before it.
+            const held = heldBack(item, items);
+            expect(terminal(item) || held).toBe(true);
+            seen.hit('heldBackByGroup', held);
             const sends = world.sends.filter((record) => record.key === item.key);
             expect(sends.length).toBeLessThanOrEqual(maxAttempts);
             const permanent = sends.findIndex((record) => record.outcome === 'permanent');
@@ -497,7 +519,8 @@ describe('property 5: with two tabs, the same key is never in flight twice', () 
         const { world, senderChanges, reenqueuedWhileInFlight } = await runTabs(config, ops, true);
         world.setOnline(true);
         world.tabs.forEach((tab) => void tab.queue.start());
-        await settle(world, () => world.stored().every(terminal));
+        // Stop early once the property is already broken; a broken lock can keep the tabs busy for the whole deadline.
+        await settle(world, () => world.maxSameKeyInFlight > 1 || world.stored().every(terminal));
         expect(world.maxSameKeyInFlight).toBeLessThanOrEqual(1);
 
         seen.hit('senderChanged', senderChanges > 0);
@@ -567,6 +590,155 @@ describe('property 6: with two tabs, every key ends applied exactly once and suc
           Array.from(requested.keys()).some((key) => new Set(world.sends.filter((s) => s.key === key).map((s) => s.tab)).size > 1),
         );
       }),
+      { numRuns: NUM_RUNS },
+    );
+    seen.expectAllReached();
+  });
+});
+
+/** Delays a classifier might return, including values that do not fit a timestamp. */
+const wildDelay = fc.oneof(
+  fc.constantFrom<number | undefined>(undefined, NaN, Infinity, -Infinity, -1, 0, 1e300, Number.MAX_VALUE, 2 ** 31, 2 ** 53),
+  fc.double(),
+  fc.integer({ min: -1e9, max: 1e9 }),
+);
+const wildDecision = fc.record({
+  type: fc.constantFrom('retryable', 'rateLimited', 'permanent'),
+  delayMs: wildDelay,
+}) as fc.Arbitrary<ErrorClassification>;
+
+const isSlot = (key: string) => key === 'idempotent-queue:a' || key === 'idempotent-queue:b';
+
+describe('property 7: every slot the queue writes passes the load validation', () => {
+  it('holds for any classifier output, including NaN, Infinity, negative and huge delays', async () => {
+    const seen = coverage('nonFiniteDelay', 'negativeDelay', 'hugeDelay', 'retryScheduled', 'crashReload');
+    await fc.assert(
+      fc.asyncProperty(
+        worldConfig(anyFault, fc.integer({ min: 1, max: 5 })),
+        fc.array(wildDecision, { minLength: 1, maxLength: 12 }),
+        fc.array(
+          fc.oneof(
+            { weight: 4, arbitrary: enqueueOp },
+            { weight: 4, arbitrary: advanceOp },
+            { weight: 1, arbitrary: indexOp('discard') },
+            { weight: 1, arbitrary: indexOp('retry') },
+            { weight: 1, arbitrary: simple('crash') },
+            { weight: 1, arbitrary: simple('flush') },
+            { weight: 1, arbitrary: simple('stop') },
+            { weight: 1, arbitrary: simple('start') },
+          ),
+          { maxLength: 40, size: 'medium' },
+        ),
+        async (config, decisions, ops) => {
+          let next = 0;
+          const used: ErrorClassification[] = [];
+          const world = new World({
+            ...config,
+            classifyError: () => {
+              const decision = decisions[next++ % decisions.length];
+              used.push(decision);
+              return decision;
+            },
+          });
+          void world.process.queue.start();
+          let n = 0;
+          for (const op of ops) {
+            const { queue } = world.process;
+            const items = queue.getItems();
+            if (op.t === 'enqueue') enqueue(world, 0, op.key, n++);
+            else if (op.t === 'crash') {
+              world.crash();
+              void world.process.queue.start();
+              seen.hit('crashReload');
+            } else if (op.t === 'discard' && items.length > 0) void queue.discard(items[op.index % items.length].id);
+            else if (op.t === 'retry' && items.length > 0) queue.retry(items[op.index % items.length].id).catch(() => undefined);
+            else if (op.t === 'flush') void queue.flush();
+            else if (op.t === 'stop') void queue.stop();
+            else if (op.t === 'start') void queue.start();
+            else if (op.t === 'advance') await world.clock.advance(op.ms);
+            await world.clock.advance(0);
+          }
+          await world.clock.advance(1000);
+
+          for (const write of world.writes) {
+            if (!isSlot(write.key)) continue;
+            const result = decodeEnvelope(write.value);
+            expect({ key: write.key, reason: result.ok ? undefined : result.reason }).toEqual({ key: write.key, reason: undefined });
+          }
+          // The queue itself never produced a state that storage had to refuse.
+          expect(world.storageErrors.map(String)).toEqual([]);
+          const delays: Array<number | undefined> = [];
+          used.forEach((decision) => decision.type !== 'permanent' && delays.push(decision.delayMs));
+          seen.hit('nonFiniteDelay', delays.some((delay) => delay !== undefined && !isFinite(delay)));
+          seen.hit('negativeDelay', delays.some((delay) => delay !== undefined && delay < 0));
+          seen.hit('hugeDelay', delays.some((delay) => delay !== undefined && delay > 1e15 && isFinite(delay)));
+          seen.hit('retryScheduled', world.process.queue.getItems().some((item) => item.status === 'pending' && item.attempts > 0));
+        },
+      ),
+      { numRuns: NUM_RUNS },
+    );
+    seen.expectAllReached();
+  });
+});
+
+/** Item-like values with any number in the timestamp fields, as a buggy change might produce. */
+const wildNumber = fc.oneof(
+  fc.constantFrom(NaN, Infinity, -Infinity, 0, 1, 1e300),
+  fc.integer({ min: 0, max: 1e6 }),
+);
+const wildItem = (id: number) =>
+  fc.record({
+    id: fc.constant(`id-${id}`),
+    key: fc.constantFrom(`key-${id}`, 'key-shared'),
+    payload: fc.oneof(fc.constant(1), fc.constant(undefined), fc.constant({ amount: 5 })),
+    status: fc.constantFrom('pending', 'inflight', 'succeeded', 'failed', 'dead', 'unknown'),
+    attempts: wildNumber,
+    sequence: wildNumber,
+    createdAt: wildNumber,
+    updatedAt: wildNumber,
+    nextAttemptAt: wildNumber,
+  }) as unknown as fc.Arbitrary<QueueItem>;
+
+describe('property 8: the persistence layer never writes a slot that fails its own validation', () => {
+  it('refuses any invalid change, keeps the stored state and still commits the valid changes of the batch', async () => {
+    const seen = coverage('refused', 'committed', 'batchedWithRefused');
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(fc.array(fc.nat({ max: 5 }).chain(wildItem), { maxLength: 4 }), { minLength: 1, maxLength: 6 }),
+        fc.boolean(),
+        async (changes, atomic) => {
+          const memory = createMemoryStorage();
+          const storage = atomic
+            ? memory
+            : { getItem: memory.getItem, setItem: memory.setItem, removeItem: memory.removeItem };
+          const persistence = new QueuePersistence(storage, 'idempotent-queue', createMemoryLocks(), {
+            onCommit: () => undefined,
+            onCleared: () => undefined,
+            onQuarantine: () => undefined,
+            onStorageError: () => undefined,
+            now: () => 0,
+          });
+          const outcomes = await Promise.all(
+            changes.map((items) =>
+              persistence.transact(() => ({ items, result: undefined })).then(
+                () => 'ok',
+                () => 'refused',
+              ),
+            ),
+          );
+          for (const slot of ['a', 'b']) {
+            const raw = memory.data.get(`idempotent-queue:${slot}`);
+            if (raw !== undefined) expect(decodeEnvelope(raw).ok).toBe(true);
+          }
+          // The stored state is the last change that was not refused.
+          const last = outcomes.lastIndexOf('ok');
+          const stored = readSlots(memory.data.get('idempotent-queue:a'), memory.data.get('idempotent-queue:b')).items;
+          expect(stored).toEqual(last < 0 ? [] : JSON.parse(JSON.stringify(changes[last])));
+          seen.hit('refused', outcomes.includes('refused'));
+          seen.hit('committed', outcomes.includes('ok'));
+          seen.hit('batchedWithRefused', outcomes.includes('ok') && outcomes.includes('refused'));
+        },
+      ),
       { numRuns: NUM_RUNS },
     );
     seen.expectAllReached();

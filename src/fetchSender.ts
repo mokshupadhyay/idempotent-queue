@@ -3,10 +3,16 @@ import { readGlobal } from './env.js';
 import { isPageHidden } from './page.js';
 import type { QueueItem, SendContext } from './types.js';
 
+/** Every shape `fetch` accepts for headers: a record, an array of `[name, value]` pairs, or a `Headers` object. */
+export type HeadersInitLike =
+  | Record<string, string>
+  | ReadonlyArray<readonly [string, string]>
+  | { forEach(callback: (value: string, name: string) => void): void };
+
 /** The subset of `fetch`'s `RequestInit` the sender sets or passes through. */
 export interface FetchInit {
   method?: string;
-  headers?: Record<string, string>;
+  headers?: HeadersInitLike;
   body?: unknown;
   keepalive?: boolean;
   [option: string]: unknown;
@@ -37,14 +43,21 @@ export interface FetchSenderOptions {
    * - `false` or omitted: never (an `init.keepalive` you pass is kept).
    *
    * Browsers refuse a keepalive request whose body, together with the other
-   * keepalive requests in flight, exceeds 64 KiB. A string body larger than
-   * that is sent without `keepalive` instead of failing on every attempt.
+   * keepalive requests in flight, exceeds 64 KiB. So `keepalive` is set only
+   * when the body's size is known (a string, `Blob`, `ArrayBuffer`, typed
+   * array, `DataView` or `URLSearchParams`) and fits in what is left of
+   * 64 KiB after the keepalive requests this page already has in flight.
+   * Otherwise (a `FormData` or a stream, or no room left) the request is
+   * sent normally instead of failing on every attempt.
    */
   keepalive?: boolean | 'pagehide';
 }
 
 /** Browsers cap the bodies of keepalive requests in flight at 64 KiB in total. */
 export const KEEPALIVE_BODY_LIMIT = 64 * 1024;
+
+/** Bytes of keepalive bodies this page has in flight, across every `fetchSender`. */
+let keepaliveInFlight = 0;
 
 function utf8Length(text: string): number {
   let bytes = 0;
@@ -58,6 +71,53 @@ function utf8Length(text: string): number {
     } else bytes += 3;
   }
   return bytes;
+}
+
+const tag = (value: unknown) => Object.prototype.toString.call(value);
+
+/** The size in bytes of a fetch body, or `undefined` when it cannot be known without reading it. */
+export function bodySize(body: unknown): number | undefined {
+  if (body == null) return 0;
+  if (typeof body === 'string') return utf8Length(body);
+  if (typeof body !== 'object') return undefined;
+  const kind = tag(body);
+  if (kind === '[object URLSearchParams]') return utf8Length(String(body));
+  if (kind === '[object FormData]' || kind === '[object ReadableStream]') return undefined;
+  const { byteLength, size } = body as { byteLength?: unknown; size?: unknown };
+  // ArrayBuffer, typed arrays and DataView.
+  if (typeof byteLength === 'number') return byteLength;
+  // Blob and File.
+  if (typeof size === 'number' && typeof (body as { slice?: unknown }).slice === 'function') return size;
+  return undefined;
+}
+
+/** Copies headers in any `HeadersInitLike` shape into `[name, value]` pairs. */
+function headerPairs(headers: HeadersInitLike | undefined): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [];
+  if (!headers) return pairs;
+  if (Array.isArray(headers)) {
+    for (const pair of headers as ReadonlyArray<readonly [string, string]>) {
+      if (pair && pair.length >= 2) pairs.push([String(pair[0]), String(pair[1])]);
+    }
+  } else if (typeof (headers as { forEach?: unknown }).forEach === 'function') {
+    (headers as { forEach(callback: (value: string, name: string) => void): void }).forEach((value, name) =>
+      pairs.push([name, value]),
+    );
+  } else {
+    const record = headers as Record<string, string>;
+    for (const name of Object.keys(record)) pairs.push([name, record[name]]);
+  }
+  return pairs;
+}
+
+/** Combines the caller's signal with the queue's, so either one aborts the request. */
+function combineSignals(own: unknown, queue: unknown): unknown {
+  if (own === undefined) return queue;
+  if (queue === undefined) return own;
+  const Signal = readGlobal('AbortSignal') as { any?: (signals: unknown[]) => unknown } | undefined;
+  if (Signal && typeof Signal.any === 'function') return Signal.any([own, queue]);
+  // Without AbortSignal.any, the queue's signal wins: it enforces attemptTimeoutMs and stop().
+  return queue;
 }
 
 function parseBody(text: string, contentType: string | null): unknown {
@@ -104,12 +164,12 @@ export function fetchSender<TPayload = unknown, TResult = unknown>(
     const base = (typeof init === 'function' ? init(item) : init) || {};
     const headers: Record<string, string> = {};
     let hasContentType = false;
-    const given = base.headers || {};
-    for (const name of Object.keys(given)) {
+    for (const [name, value] of headerPairs(base.headers)) {
       // Never let a caller's header override the item's key.
       if (name.toLowerCase() === headerName.toLowerCase()) continue;
       if (name.toLowerCase() === 'content-type') hasContentType = true;
-      headers[name] = given[name];
+      // Repeated names are joined, as `Headers` does.
+      headers[name] = Object.prototype.hasOwnProperty.call(headers, name) ? `${headers[name]}, ${value}` : value;
     }
     headers[headerName] = context.key;
     let body: unknown = base.body;
@@ -122,12 +182,25 @@ export function fetchSender<TPayload = unknown, TResult = unknown>(
       }
     }
     const request: Record<string, unknown> = { ...base, method: base.method || 'POST', headers, body };
+    const signal = combineSignals(base.signal, context.signal);
+    if (signal !== undefined) request.signal = signal;
     const mode = options.keepalive;
+    let reserved = 0;
     if (mode === true || (mode === 'pagehide' && isPageHidden())) {
-      const fits = typeof body !== 'string' || utf8Length(body) <= KEEPALIVE_BODY_LIMIT;
-      if (fits) request.keepalive = true;
+      const size = bodySize(body);
+      if (size !== undefined && keepaliveInFlight + size <= KEEPALIVE_BODY_LIMIT) {
+        request.keepalive = true;
+        reserved = size;
+        keepaliveInFlight += size;
+      }
     }
-    const response = await doFetch(typeof url === 'function' ? url(item) : url, request);
+    let response: FetchResponseLike;
+    try {
+      response = await doFetch(typeof url === 'function' ? url(item) : url, request);
+    } finally {
+      // The browser counts a keepalive body until the response arrives.
+      keepaliveInFlight -= reserved;
+    }
     let text = '';
     try {
       text = await response.text();

@@ -3,7 +3,7 @@ export { defaultClassifyError, HttpError, parseRetryAfter } from './classify.js'
 export { backoffCeiling, backoffDelay, DEFAULT_RETRY_POLICY } from './backoff.js';
 export type { ResolvedRetryPolicy } from './backoff.js';
 export { getKeySource, uuidV4, MAX_KEY_LENGTH } from './keys.js';
-export { DEFAULT_STORAGE_KEY, readQuarantine } from './persistence.js';
+export { DEFAULT_STORAGE_KEY, InvalidStateError, readQuarantine } from './persistence.js';
 export type { QuarantineEntry } from './persistence.js';
 export { createIndexedDBStorage, createLocalStorageAdapter, createMemoryStorage } from './storage.js';
 export type {
@@ -20,7 +20,7 @@ export type { BroadcastQueueChannel } from './channel.js';
 export { createBrowserConnectivity, subscribeToPageVisibility } from './connectivity.js';
 export type { BrowserConnectivityOptions, Connectivity } from './connectivity.js';
 export { fetchSender, KEEPALIVE_BODY_LIMIT } from './fetchSender.js';
-export type { FetchInit, FetchLike, FetchResponseLike, FetchSenderOptions } from './fetchSender.js';
+export type { FetchInit, FetchLike, FetchResponseLike, FetchSenderOptions, HeadersInitLike } from './fetchSender.js';
 export { countItems } from './counts.js';
 export type { QueueCounts } from './counts.js';
 export type {
@@ -48,5 +48,6 @@ export type {
   QueueTimers,
   RetryPolicy,
   SendContext,
+  StopOptions,
   StorageWrite,
 } from './types.js';

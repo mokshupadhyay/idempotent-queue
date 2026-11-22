@@ -66,8 +66,10 @@ function fromMathRandom(): string {
  *    warning is logged. `getKeySource()` reports it at any time.
  *
  * Browsers expose `crypto.randomUUID` only in secure contexts (HTTPS and
- * localhost); plain-HTTP pages fall back to `getRandomValues`. Node 18+ has
- * both. Pass your own `generateKey` for any other source.
+ * localhost); plain-HTTP pages fall back to `getRandomValues`. Node 20+, Bun
+ * and Deno have both. Node 18 has no global `crypto`, so it falls back to
+ * `Math.random()`: pass `generateKey: randomUUID` from `node:crypto` there.
+ * Pass your own `generateKey` for any other source.
  */
 export function uuidV4(): string {
   const crypto = getCrypto();

@@ -63,6 +63,20 @@ const mutations = [
     find: 'if (message.source !== instanceId) refresh();',
     replace: 'if (false) refresh();',
   },
+  {
+    property: 'property 7',
+    description: 'Do not clamp huge or infinite classifier delays',
+    file: 'src/queue.ts',
+    find: '  if (delay > MAX_CLASSIFIED_DELAY_MS) delay = maxDelayMs;',
+    replace: '',
+  },
+  {
+    property: 'property 8',
+    description: 'Skip the load validation before a write',
+    file: 'src/persistence.ts',
+    find: '  if (reason) throw new InvalidStateError(reason);',
+    replace: '  if (false && reason) throw new InvalidStateError(reason);',
+  },
 ];
 
 const backupDir = mkdtempSync(join(tmpdir(), 'idempotent-queue-mutation-'));

@@ -118,7 +118,7 @@ describe('two tabs', () => {
     one.close();
     await b.tick();
     expect(two.queue.isSender()).toBe(true);
-    expect(b.calls.map((call) => [call.tab, call.context])).toEqual([
+    expect(b.calls.map((call) => [call.tab, { key: call.context.key, attempt: call.context.attempt }])).toEqual([
       ['one', { key: 'pay-1', attempt: 1 }],
       ['two', { key: 'pay-1', attempt: 2 }],
     ]);
@@ -148,7 +148,7 @@ describe('two tabs', () => {
     await b.tick();
     b.calls[1].resolve();
     await b.tick();
-    expect(b.calls.map((call) => call.context)).toEqual([
+    expect(b.calls.map((call) => ({ key: call.context.key, attempt: call.context.attempt }))).toEqual([
       { key: 'k', attempt: 1 },
       { key: 'other', attempt: 1 },
       { key: 'k', attempt: 1 },
@@ -260,7 +260,7 @@ describe('storage adapters with two tabs', () => {
         locks,
         channel,
         send: (_item, context) => {
-          sent.push([tab, context]);
+          sent.push([tab, { key: context.key, attempt: context.attempt }]);
           return 'ok';
         },
         subscribeToVisibility: null,

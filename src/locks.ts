@@ -1,5 +1,6 @@
 import { getNavigator, randomId, readGlobal, type EventListenerLike } from './env.js';
 import type { AbortSignalLike, LockRequestOptions, QueueLocks } from './types.js';
+import { timerDelay } from './timers.js';
 
 function abortError(): Error {
   const error = new Error('The lock request was aborted.');
@@ -230,7 +231,7 @@ export function createBroadcastChannelLocks(options: BroadcastChannelLocksOption
         clearTimeout(timer);
         resolve();
       };
-      const timer = setTimeout(finish, ms);
+      const timer = setTimeout(finish, timerDelay(ms));
       if (wake) wake(finish);
     });
 

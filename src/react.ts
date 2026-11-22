@@ -18,7 +18,19 @@ export interface QueueItemsSource<TPayload = unknown> {
 
 type Source<TPayload> = QueueItemsSource<TPayload>;
 
-type UseSyncExternalStore = <T>(subscribe: (onChange: () => void) => () => void, getSnapshot: () => T) => T;
+type UseSyncExternalStore = <T>(
+  subscribe: (onChange: () => void) => () => void,
+  getSnapshot: () => T,
+  getServerSnapshot?: () => T,
+) => T;
+
+/**
+ * What the hook shows during server rendering and hydration: no items. The
+ * server cannot see the browser's storage, and the client must hydrate the
+ * same markup, then React re-renders with the real items.
+ */
+const SERVER_ITEMS: readonly QueueItem<never>[] = Object.freeze([]);
+const getServerSnapshot = () => SERVER_ITEMS;
 
 /** React 18+ path. */
 export function useItemsWithSyncExternalStore<TPayload>(
@@ -27,7 +39,7 @@ export function useItemsWithSyncExternalStore<TPayload>(
 ): readonly QueueItem<TPayload>[] {
   const subscribe = React.useCallback((onChange: () => void) => queue.subscribe(() => onChange()), [queue]);
   const getSnapshot = React.useCallback(() => queue.getItems(), [queue]);
-  return useSyncExternalStore(subscribe, getSnapshot);
+  return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 }
 
 /** React 16.8 and 17 path: subscribe in an effect and re-read the snapshot. */
@@ -57,6 +69,11 @@ const builtInSyncExternalStore = (React as unknown as { useSyncExternalStore?: U
  * including changes made by other tabs once the queue is started. Uses
  * `useSyncExternalStore` on React 18+ and an effect subscription on React
  * 16.8 and 17.
+ *
+ * Server rendering: on React 18+ the server render and hydration show no
+ * items, then the client re-renders with the queue's items. On React 16.8
+ * and 17 the server renders the queue's current items (normally none on a
+ * server).
  */
 export function useQueueItems<TPayload = unknown>(queue: QueueItemsSource<TPayload>): QueueItemsState<TPayload> {
   const items = builtInSyncExternalStore

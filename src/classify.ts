@@ -47,17 +47,21 @@ function readHeader(headers: unknown, name: string): string | undefined {
 
 /**
  * Parses a `Retry-After` value: delay-seconds or an HTTP date.
- * Returns milliseconds from `now`, never negative, or `undefined` if invalid.
+ * Returns milliseconds from `now`, never negative, or `undefined` if invalid
+ * or too large to be a finite, safe integer number of milliseconds.
  */
 export function parseRetryAfter(value: string | null | undefined, now: number): number | undefined {
   if (value == null) return undefined;
   const trimmed = String(value).trim();
   if (trimmed === '') return undefined;
-  if (/^\d+(\.\d+)?$/.test(trimmed)) return Math.round(parseFloat(trimmed) * 1000);
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const ms = Math.round(parseFloat(trimmed) * 1000);
+    return ms <= Number.MAX_SAFE_INTEGER ? ms : undefined;
+  }
   // An HTTP date names a weekday or month; this also stops Date.parse('-1') from reading a year.
   if (!/[a-z]/i.test(trimmed)) return undefined;
   const date = Date.parse(trimmed);
-  if (Number.isNaN(date)) return undefined;
+  if (!isFinite(date) || !isFinite(now)) return undefined;
   return Math.max(0, date - now);
 }
 
@@ -79,14 +83,22 @@ export function httpDetails(error: unknown): { status: number; headers: unknown 
  * | Error | Decision |
  * | --- | --- |
  * | No HTTP status (network failure, timeout, any other thrown value) | retryable |
- * | 408, 425, 429, 500-599 | retryable; `rateLimited` when a valid `Retry-After` is present |
+ * | 408, 409, 425, 429, 500-599 | retryable; `rateLimited` when a valid `Retry-After` is present |
  * | Any other status (other 4xx, and 1xx-3xx thrown as errors) | permanent |
+ *
+ * 409 is retryable because servers that implement idempotency keys (the IETF
+ * Idempotency-Key header draft, Stripe) answer 409 Conflict while a request
+ * with the same key is still being processed. The first request may well
+ * succeed, so the item must not end `dead`; a retry with the same key later
+ * gets the stored result. The draft's other key errors stay permanent: 400
+ * (the key is missing) and 422 (the key was reused with a different payload).
  */
 export function defaultClassifyError(error: unknown, context: Pick<ClassifyContext, 'now'>): ErrorClassification {
   const details = httpDetails(error);
   if (!details) return { type: 'retryable' };
   const { status } = details;
-  const retryable = status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+  const retryable =
+    status === 408 || status === 409 || status === 425 || status === 429 || (status >= 500 && status <= 599);
   if (!retryable) return { type: 'permanent' };
   const delayMs = parseRetryAfter(readHeader(details.headers, 'Retry-After'), context.now);
   if (delayMs !== undefined) return { type: 'rateLimited', delayMs };

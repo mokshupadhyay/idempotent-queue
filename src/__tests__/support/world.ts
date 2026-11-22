@@ -3,7 +3,15 @@ import { HttpError } from '../../classify';
 import { readSlots } from '../../persistence';
 import { createIdempotentQueue } from '../../queue';
 import { createMemoryStorage } from '../../storage';
-import type { IdempotentQueue, QueueChannel, QueueItem, QueueOptions, QueueStorage, SendContext } from '../../types';
+import type {
+  ErrorClassifier,
+  IdempotentQueue,
+  QueueChannel,
+  QueueItem,
+  QueueOptions,
+  QueueStorage,
+  SendContext,
+} from '../../types';
 import { FakeClock, seededRandom } from './fakeClock';
 import { FakeLocks } from './fakeLocks';
 
@@ -70,6 +78,8 @@ export interface WorldConfig {
   atomicStorage?: boolean;
   /** Tabs tell each other about changes over a channel; otherwise they poll. Default true. */
   useChannel?: boolean;
+  /** Replaces the default classifier in every tab. */
+  classifyError?: ErrorClassifier<Payload>;
 }
 
 export type Tab = {
@@ -98,6 +108,10 @@ export class World {
   readonly inflight = new Map<string, number>();
   /** Highest number of simultaneous requests seen for one key, across every live tab. */
   maxSameKeyInFlight = 0;
+  /** Every value written to storage, in order. */
+  readonly writes: Array<{ key: string; value: string }> = [];
+  /** `storage-error` events from every tab. */
+  readonly storageErrors: unknown[] = [];
   online = true;
   readonly tabs: Tab[] = [];
   private tabCount = 0;
@@ -149,7 +163,11 @@ export class World {
     const read = (key: string) => (this.disk.has(key) ? (this.disk.get(key) as string) : null);
     const storage: QueueStorage = {
       getItem: (key) => (this.clock.isDead(owner) ? never() : Promise.resolve(read(key))),
-      setItem: (key, value) => later(() => void this.disk.set(key, value)),
+      setItem: (key, value) =>
+        later(() => {
+          this.writes.push({ key, value });
+          this.disk.set(key, value);
+        }),
       removeItem: (key) => later(() => void this.disk.delete(key)),
     };
     if (this.config.atomicStorage !== false) {
@@ -159,7 +177,10 @@ export class World {
           const writes = mutate(keys.map(read));
           for (const write of writes) {
             if (write.value === null) this.disk.delete(write.key);
-            else this.disk.set(write.key, write.value);
+            else {
+              this.writes.push({ key: write.key, value: write.value });
+              this.disk.set(write.key, write.value);
+            }
           }
         });
     }
@@ -237,6 +258,7 @@ export class World {
       syncIntervalMs: 50,
       send,
       retry: this.config.retry,
+      ...(this.config.classifyError ? { classifyError: this.config.classifyError } : {}),
       concurrency: this.config.concurrency,
       isOnline: () => this.online,
       subscribeToConnectivity: this.config.useSubscription
@@ -254,7 +276,9 @@ export class World {
       generateKey: () => `id-${Math.floor(this.random() * 1e12).toString(36)}-${this.clock.now}`,
     });
     // A queue that never logs keeps test output readable.
-    queue.subscribe(() => undefined);
+    queue.subscribe((event) => {
+      if (event.type === 'storage-error') this.storageErrors.push(event.error);
+    });
     return { id, owner, queue };
   }
 

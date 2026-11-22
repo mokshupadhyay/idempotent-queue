@@ -109,7 +109,9 @@ describe('fetchSender', () => {
       send: fetchSender('u', undefined, { fetch }),
       now: () => now,
       random: () => 0,
+      // These timers fire at once whatever the delay, so the attempt timeout is turned off.
       timers: { setTimeout: (callback) => Promise.resolve().then(callback), clearTimeout: () => undefined },
+      attemptTimeoutMs: Infinity,
     });
     await queue.start();
     await queue.enqueue({ payload: { amount: 1 }, key: 'pay-1' });
