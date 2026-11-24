@@ -370,6 +370,10 @@ IndexedDB is tested with [fake-indexeddb](https://github.com/dumbmatter/fakeInde
 - `src/timers.ts` clamps every timer delay to what `setTimeout` accepts.
 - `src/keys.ts` generates keys. `src/fetchSender.ts` is the `fetch` helper. `src/react.ts` is the React hook.
 
+## Author
+
+Built and maintained by [Moksh Upadhyay](https://mokshupadhyay.com).
+
 ## License
 
 MIT
