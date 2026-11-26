@@ -6,6 +6,8 @@
 
 A queue for requests that change state on a server, such as a payment, a transfer or an order, so they survive a flaky network, a reload and a closed tab. It runs in browsers and in Node 18+. It is the web version of [react-native-idempotent-queue](https://github.com/mokshupadhyay/react-native-idempotent-queue), with the same design and API.
 
+Read why it works this way: [Safe to retry](https://mokshupadhyay.com/writing/safe-to-retry), with a retry simulator you can try in the browser.
+
 - **Saved before it is sent.** `enqueue` resolves only after the request is written to storage. Each attempt is recorded in storage before the request leaves.
 - **One idempotency key per request.** The key is created once and sent with every attempt: after a timeout, a 5xx, a lost response, a reload, or a tab closed in the middle of a request.
 - **Never sent in parallel with itself, across tabs.** Tabs of the same site share the queue. One tab at a time holds a [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) and sends; when it closes, another tab takes over. A key is never in flight twice. Items in the same `group` go one at a time, in order.
